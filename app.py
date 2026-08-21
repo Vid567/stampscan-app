@@ -8,10 +8,9 @@ rejected by the serverless endpoint.
 """
 
 import os
-import io
+import re
 import json
 import base64
-import tempfile
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +19,7 @@ import gradio as gr
 from inference_sdk import InferenceHTTPClient
 
 import openpyxl
-from openpyxl.styles import Font, PatternFill
+from openpyxl.styles import Font, PatternFill, Alignment
 
 # ---- Config -----------------------------------------------------------------
 API_KEY = os.environ.get("ROBOFLOW_API_KEY", "")
@@ -36,6 +35,18 @@ client = InferenceHTTPClient(api_url=API_URL, api_key=API_KEY) if API_KEY else N
 # passed to launch(allowed_paths=...).
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+COLUMNS = [
+    "#",
+    "Country",
+    "Issue / Series",
+    "Year",
+    "Denomination",
+    "Catalog match",
+    "OCR text",
+    "Condition",
+    "Confidence",
+]
 
 
 # ---- Response normalisation --------------------------------------------------
@@ -85,6 +96,58 @@ def _as_count(value, fallback):
     return fallback
 
 
+# ---- Field extraction --------------------------------------------------------
+# The OCR and analysis blocks are language-model steps, so they return JSON as a
+# string -- often wrapped in a markdown ```json fence. Dumping that raw into a
+# spreadsheet cell is useless, so unwrap it and split it into real columns.
+_FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
+
+
+def _coerce(entry):
+    """Get a dict out of a dict, a JSON string, or a fenced JSON string."""
+    if isinstance(entry, dict):
+        return entry
+    if isinstance(entry, list):
+        return _coerce(entry[0]) if entry else {}
+    if isinstance(entry, str):
+        raw = _FENCE.sub("", entry).strip()
+        if raw.startswith("{") or raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    parsed = parsed[0] if parsed else {}
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+        return {"all_text": entry}
+    return {}
+
+
+def _pick(d, *keys):
+    """First non-empty value among keys, flattened to a string."""
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, "", [], {}):
+            if isinstance(v, (dict, list)):
+                return json.dumps(v, ensure_ascii=False)
+            return str(v)
+    return ""
+
+
+def _condition_of(analysis):
+    """Prefer an explicit condition field; otherwise assemble one."""
+    explicit = _pick(analysis, "condition", "grade", "state")
+    if explicit:
+        return explicit
+    parts = []
+    for k in ("damage", "cancellation", "centering", "perforations", "gum"):
+        v = analysis.get(k)
+        if v not in (None, "", [], {}):
+            parts.append(f"{k}: {v}")
+    return ", ".join(parts)
+
+
 # ---- Helpers ----------------------------------------------------------------
 def _stamp():
     """Timestamp for output filenames, so repeat scans don't overwrite."""
@@ -112,44 +175,26 @@ def _decode_output_image(value):
         return None
 
 
-def _text_from(entry):
-    if isinstance(entry, dict):
-        for k in ("text", "ocr", "value", "denomination", "result", "output"):
-            if entry.get(k):
-                return str(entry[k])
-    elif isinstance(entry, str):
-        return entry
-    return ""
-
-
-def _condition_from(entry):
-    if isinstance(entry, dict):
-        parts = []
-        for k in ("condition", "damage", "cancellation", "centering"):
-            if entry.get(k):
-                parts.append(f"{k}: {entry[k]}")
-        return ", ".join(parts)
-    elif isinstance(entry, str):
-        return entry
-    return ""
-
-
 def _build_excel(rows):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Stamps"
-    headers = ["#", "Type", "Confidence", "Text / OCR", "Condition"]
-    ws.append(headers)
+    ws.append(COLUMNS)
     fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
     font = Font(color="FFFFFF", bold=True)
     for cell in ws[1]:
         cell.fill = fill
         cell.font = font
+        cell.alignment = Alignment(vertical="center")
     for r in rows:
         ws.append(r)
-    for col in ws.columns:
-        width = max(len(str(c.value or "")) for c in col) + 2
-        ws.column_dimensions[col[0].column_letter].width = min(width, 50)
+    widths = {"#": 5, "Country": 16, "Issue / Series": 46, "Year": 8,
+              "Denomination": 14, "Catalog match": 20, "OCR text": 30,
+              "Condition": 26, "Confidence": 11}
+    for idx, name in enumerate(COLUMNS, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = widths.get(name, 18)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
     path = OUTPUT_DIR / f"stamp-inventory-{_stamp()}.xlsx"
     wb.save(path)
     return str(path)
@@ -183,12 +228,9 @@ def scan(image_path):
         return None, [], f"Error calling the workflow: {e}", None
 
     # Everything below is parsing. Never let it crash the UI -- a traceback in
-    # the Render log is useful, four red "Error" boxes are not.
+    # the Render log is useful, red "Error" boxes are not.
     try:
         scan_out = _first_output(result)
-
-        # Log the actual shape so a future format change is diagnosable
-        # without having to reproduce it.
         print("[stampscan] workflow output shape:", _describe(scan_out), flush=True)
 
         predictions = _as_list(scan_out.get("predictions"))
@@ -201,27 +243,40 @@ def scan(image_path):
         rows = []
         for i in range(n):
             pred = predictions[i] if i < len(predictions) else {}
-            ocr = ocr_results[i] if i < len(ocr_results) else {}
-            cond = analysis[i] if i < len(analysis) else {}
+            ocr = _coerce(ocr_results[i] if i < len(ocr_results) else {})
+            ana = _coerce(analysis[i] if i < len(analysis) else {})
 
             conf = pred.get("confidence", "") if isinstance(pred, dict) else ""
             if isinstance(conf, (int, float)) and not isinstance(conf, bool):
                 conf = f"{conf:.2f}"
-            cls = pred.get("class", "stamp") if isinstance(pred, dict) else "stamp"
 
-            rows.append([i + 1, cls, conf, _text_from(ocr), _condition_from(cond)])
+            country = _pick(ana, "likely_country", "country") or _pick(ocr, "country_text", "country")
+            denom = _pick(ana, "denomination", "value", "face_value") or _pick(ocr, "value_text")
+            ocr_text = _pick(ocr, "all_text", "text", "ocr", "value_text")
+
+            rows.append([
+                i + 1,
+                country,
+                _pick(ana, "likely_issue", "issue", "series", "description"),
+                _pick(ana, "likely_year", "year", "date"),
+                denom,
+                _pick(ana, "catalog_match", "catalog", "catalogue", "scott"),
+                ocr_text.replace("\n", " ").strip(),
+                _condition_of(ana),
+                conf,
+            ])
 
         annotated = _decode_output_image(scan_out.get("output_image"))
         xlsx = _build_excel(rows) if rows else None
 
         if n == 0:
             keys = list(scan_out.keys()) if isinstance(scan_out, dict) else []
-            summary = (
-                "The workflow ran but returned no stamps. "
-                f"Output keys were: {keys}"
-            )
+            summary = f"The workflow ran but returned no stamps. Output keys were: {keys}"
         else:
-            summary = f"Found {count} stamp(s)."
+            summary = (
+                f"Found {count} stamp(s). "
+                "Click the blue file size to the right of the filename to download the Excel."
+            )
 
         return annotated, rows, summary, xlsx
 
@@ -246,11 +301,7 @@ demo = gr.Interface(
     inputs=gr.Image(type="filepath", label="Upload an album-page photo"),
     outputs=[
         gr.Image(label="Detected stamps (numbered)"),
-        gr.Dataframe(
-            headers=["#", "Type", "Confidence", "Text / OCR", "Condition"],
-            label="Results (review before trusting)",
-            wrap=True,
-        ),
+        gr.Dataframe(headers=COLUMNS, label="Results (review before trusting)", wrap=True),
         gr.Textbox(label="Summary"),
         gr.File(label="Download Excel"),
     ],
