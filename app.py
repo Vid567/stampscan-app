@@ -13,6 +13,8 @@ import json
 import base64
 import tempfile
 import traceback
+from datetime import datetime
+from pathlib import Path
 
 import gradio as gr
 from inference_sdk import InferenceHTTPClient
@@ -27,6 +29,13 @@ WORKFLOW_ID = "automated-stamp-scanner-1787234733118"
 API_URL = "https://serverless.roboflow.com"
 
 client = InferenceHTTPClient(api_url=API_URL, api_key=API_KEY) if API_KEY else None
+
+# Gradio 4 will only serve files from directories it has been told about.
+# Anything left in the system temp dir can be built fine and still refuse to
+# download, so outputs go in a folder next to the app and that folder is
+# passed to launch(allowed_paths=...).
+OUTPUT_DIR = Path(__file__).parent / "outputs"
+OUTPUT_DIR.mkdir(exist_ok=True)
 
 
 # ---- Response normalisation --------------------------------------------------
@@ -77,6 +86,11 @@ def _as_count(value, fallback):
 
 
 # ---- Helpers ----------------------------------------------------------------
+def _stamp():
+    """Timestamp for output filenames, so repeat scans don't overwrite."""
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
 def _decode_output_image(value):
     """Roboflow may return the annotated image as base64, a data URL, or a dict."""
     if not value:
@@ -91,10 +105,9 @@ def _decode_output_image(value):
         if value.startswith("data:image"):
             value = value.split(",", 1)[1]
         raw = base64.b64decode(value)
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-        tmp.write(raw)
-        tmp.close()
-        return tmp.name
+        path = OUTPUT_DIR / f"stamp-preview-{_stamp()}.png"
+        path.write_bytes(raw)
+        return str(path)
     except Exception:
         return None
 
@@ -137,10 +150,9 @@ def _build_excel(rows):
     for col in ws.columns:
         width = max(len(str(c.value or "")) for c in col) + 2
         ws.column_dimensions[col[0].column_letter].width = min(width, 50)
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-    wb.save(tmp.name)
-    tmp.close()
-    return tmp.name
+    path = OUTPUT_DIR / f"stamp-inventory-{_stamp()}.xlsx"
+    wb.save(path)
+    return str(path)
 
 
 def _describe(value):
@@ -255,4 +267,5 @@ if __name__ == "__main__":
     demo.launch(
         server_name="0.0.0.0",
         server_port=int(os.environ.get("PORT", 7860)),
+        allowed_paths=[str(OUTPUT_DIR.resolve())],
     )
